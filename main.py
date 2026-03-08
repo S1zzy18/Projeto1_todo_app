@@ -4,18 +4,164 @@
 # dependencies = [
 #     "flet[all]>=0.80.5",
 #     "duckdb",
+#     "cryptography",
+#     "python-dotenv",
+#     "httpx",
 # ]
 # ///
 
 import asyncio
 import os
+import json
 import duckdb
 from dataclasses import field
-from typing import Callable, Any
+from typing import Callable, Any, Tuple
 
 import flet as ft
+import httpx
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
 
-STORAGE_KEY = "todo_tasks"
+STORAGE_KEY = "todo_app.tasks"
+
+
+# -------------------------
+# Encriptação Fernet
+# -------------------------
+
+load_dotenv()
+FERNET_KEY = os.getenv("FERNET_KEY")
+if not FERNET_KEY:
+    raise RuntimeError("FERNET_KEY não definida no .env")
+
+fernet = Fernet(FERNET_KEY.encode())
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+if not GITHUB_CLIENT_ID:
+    raise RuntimeError("GITHUB_CLIENT_ID não definido no .env")
+
+GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
+GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+GITHUB_USER_URL = "https://api.github.com/user"
+
+
+def encrypt_text(plain: str) -> str:
+    return fernet.encrypt(plain.encode()).decode()
+
+
+def decrypt_text(token: str) -> str:
+    try:
+        return fernet.decrypt(token.encode()).decode()
+    except Exception:
+        # Dados antigos que ainda não estavam encriptados
+        return token
+
+
+async def github_device_login(page: ft.Page) -> Tuple[str, str]:
+    """Fluxo OAuth2 Device Code com GitHub. Devolve (user_id, username)."""
+
+    # 0) Verificar se já existe uma sessão gravada localmente
+    saved_user_id = await page.shared_preferences.get("github_user_id")
+    saved_username = await page.shared_preferences.get("github_username")
+    
+    if saved_user_id and saved_username:
+        # Mostra brevemente uma mensagem apenas para dar feedback visual
+        welcome_text = ft.Text(f"Sessão restaurada: Bem-vindo de volta, {saved_username}!", size=16, color=ft.Colors.GREEN)
+        page.add(welcome_text)
+        page.update()
+        await asyncio.sleep(1.5)
+        page.controls.remove(welcome_text)
+        page.update()
+        return saved_user_id, saved_username
+
+    status = ft.Text("A autenticar com GitHub...", size=16)
+    code_text = ft.Text(size=20, weight=ft.FontWeight.BOLD, selectable=True)
+    url_text = ft.Text(selectable=True)
+
+    page.add(status, code_text, url_text)
+    page.update()
+
+    async with httpx.AsyncClient() as client:
+        # 1) Pedir device_code
+        resp = await client.post(
+            GITHUB_DEVICE_CODE_URL,
+            data={"client_id": GITHUB_CLIENT_ID, "scope": "read:user"},
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        device_code = data["device_code"]
+        user_code = data["user_code"]
+        verification_uri = data["verification_uri"]
+        interval = data.get("interval", 5)
+
+        status.value = "1) Autenticação necessária"
+        code_text.value = f"Código GitHub: {user_code}"
+        url_text.value = f"Abrir: {verification_uri}"
+        page.update()
+
+        try:
+            # await to fix coroutine not awaited warning and actually execute the redirect
+            await page.launch_url_async(verification_uri)
+        except Exception:
+            try:
+                await page.launch_url(verification_uri)
+            except Exception:
+                pass
+
+        # 2) Poll para obter access_token
+        status.value = "2) Autoriza a app no GitHub e espera..."
+        page.update()
+
+        access_token = None
+        while access_token is None:
+            await asyncio.sleep(interval)
+            token_resp = await client.post(
+                GITHUB_TOKEN_URL,
+                data={
+                    "client_id": GITHUB_CLIENT_ID,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+                headers={"Accept": "application/json"},
+                timeout=10,
+            )
+            token_data = token_resp.json()
+
+            if "error" in token_data:
+                if token_data["error"] in ("authorization_pending", "slow_down"):
+                    # continua a esperar
+                    continue
+                raise RuntimeError(f"Erro OAuth GitHub: {token_data['error']}")
+
+            access_token = token_data.get("access_token")
+
+        # 3) Obter dados do utilizador
+        user_resp = await client.get(
+            GITHUB_USER_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+            },
+            timeout=10,
+        )
+        user_resp.raise_for_status()
+        user = user_resp.json()
+
+        user_id = str(user["id"])
+        username = user.get("login", "")
+
+        status.value = f"Autenticado como {username} (GitHub)"
+        code_text.value = ""
+        url_text.value = ""
+        page.update()
+
+        # Guardar localmente (cache persistente Flet Web/Desktop)
+        await page.shared_preferences.set("github_user_id", user_id)
+        await page.shared_preferences.set("github_username", username)
+
+        return user_id, username
 
 # Diretório persistente (nunca é limpo): %APPDATA%/todo_app no Windows
 # Evita que o Parquet fique em pastas temp quando o Flet web corre via uv/cache
@@ -44,6 +190,7 @@ class Task(ft.Column):
     on_change: Callable[[], Any] = field(default=None)
     on_delete: Callable[["Task"], Any] = field(default=None)
 
+
     def init(self):
         self.display_task = ft.Checkbox(
             value=self.completed,
@@ -56,6 +203,7 @@ class Task(ft.Column):
         self.display_view = ft.Row(
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            
             controls=[
                 self.display_task,
                 ft.Row(
@@ -127,19 +275,22 @@ class Task(ft.Column):
 
 @ft.control
 class TodoApp(ft.Column):
+    user_id: str = ""
+
     def init(self):
         self.new_task = ft.TextField(
             hint_text="What needs to be done?",
             expand=True,
         )
 
-        self.tasks = ft.Column()
+        self.tasks = ft.Column(spacing=10)
 
         self.filter_status = "all"
 
         self.filter_bar = ft.SegmentedButton(
             selected=["all"],
             allow_multiple_selection=False,
+            show_selected_icon=False,
             segments=[
                 ft.Segment(value="all", label=ft.Text("all")),
                 ft.Segment(value="active", label=ft.Text("active")),
@@ -149,7 +300,6 @@ class TodoApp(ft.Column):
         )
 
         self.width = 600
-
         self.controls = [
             ft.Row(
                 controls=[
@@ -163,7 +313,7 @@ class TodoApp(ft.Column):
             ft.Column(
                 spacing=20,
                 controls=[
-                    self.filter_bar,
+                    ft.Row([self.filter_bar], alignment=ft.MainAxisAlignment.CENTER),
                     self.tasks,
                 ],
             ),
@@ -182,10 +332,18 @@ class TodoApp(ft.Column):
             try:
                 conn = duckdb.connect()
                 rows = conn.execute(
-                    f"SELECT name, completed FROM read_parquet('{PARQUET_PATH_SQL}')"
+                    f"""
+                    SELECT name, completed
+                    FROM read_parquet('{PARQUET_PATH_SQL}')
+                    WHERE user_id = ?
+                    """,
+                    [self.user_id],
                 ).fetchall()
                 conn.close()
-                data = [(str(name), bool(completed)) for name, completed in rows]
+                data = [
+                    (decrypt_text(str(name)), bool(completed))
+                    for name, completed in rows
+                ]
             except Exception:
                 continue
             current = self._tasks_to_data()
@@ -214,27 +372,44 @@ class TodoApp(ft.Column):
             try:
                 conn = duckdb.connect()
                 rows = conn.execute(
-                    f"SELECT name, completed FROM read_parquet('{PARQUET_PATH_SQL}')"
+                    f"""
+                    SELECT name, completed
+                    FROM read_parquet('{PARQUET_PATH_SQL}')
+                    WHERE user_id = ?
+                    """,
+                    [self.user_id],
                 ).fetchall()
                 conn.close()
-                data = [(str(name), bool(completed)) for name, completed in rows]
+                data = [
+                    (decrypt_text(str(name)), bool(completed))
+                    for name, completed in rows
+                ]
             except Exception:
                 pass
 
-        if not data and self.page and hasattr(self.page, "client_storage"):
+        if not data and self.page and hasattr(self.page, "shared_preferences"):
             try:
-                stored = await self.page.client_storage.get(STORAGE_KEY)
+                key = f"{STORAGE_KEY}.{self.user_id}"
+                stored = await self.page.shared_preferences.get(key)
                 if stored:
-                    data = [(t["name"], t["completed"]) for t in stored]
+                    decoded = json.loads(stored)
+                    data = [
+                        (decrypt_text(t["name"]), t["completed"]) for t in decoded
+                    ]
             except Exception:
                 pass
 
         if data:
             self._data_to_tasks(data)
-            if self.page and hasattr(self.page, "client_storage"):
+            if self.page and hasattr(self.page, "shared_preferences"):
                 try:
-                    stored = [{"name": n, "completed": c} for n, c in data]
-                    await self.page.client_storage.set(STORAGE_KEY, stored)
+                    stored = [
+                        {"name": encrypt_text(n), "completed": c} for n, c in data
+                    ]
+                    key = f"{STORAGE_KEY}.{self.user_id}"
+                    await self.page.shared_preferences.set(
+                        key, json.dumps(stored)
+                    )
                 except Exception:
                     pass
         self.update()
@@ -242,25 +417,33 @@ class TodoApp(ft.Column):
     async def save_tasks(self):
         tasks_data = self._tasks_to_data()
 
+        # Encripta o nome da tarefa para armazenamento persistente
+        encrypted_tasks = [(encrypt_text(name), completed) for name, completed in tasks_data]
+
         try:
             conn = duckdb.connect()
             conn.execute(
-                "CREATE OR REPLACE TABLE temp_tasks (name VARCHAR, completed BOOLEAN)"
+                "CREATE OR REPLACE TABLE temp_tasks (user_id VARCHAR, name VARCHAR, completed BOOLEAN)"
             )
-            for name, completed in tasks_data:
+            for name, completed in encrypted_tasks:
                 conn.execute(
-                    "INSERT INTO temp_tasks VALUES (?, ?)",
-                    [name, completed],
+                    "INSERT INTO temp_tasks VALUES (?, ?, ?)",
+                    [self.user_id, name, completed],
                 )
             conn.execute(f"COPY temp_tasks TO '{PARQUET_PATH_SQL}' (FORMAT parquet)")
             conn.close()
         except Exception:
             pass
 
-        if self.page and hasattr(self.page, "client_storage"):
+        if self.page and hasattr(self.page, "shared_preferences"):
             try:
-                stored = [{"name": n, "completed": c} for n, c in tasks_data]
-                await self.page.client_storage.set(STORAGE_KEY, stored)
+                stored = [
+                    {"name": encrypt_text(n), "completed": c} for n, c in tasks_data
+                ]
+                key = f"{STORAGE_KEY}.{self.user_id}"
+                await self.page.shared_preferences.set(
+                    key, json.dumps(stored)
+                )
             except Exception:
                 pass
 
@@ -289,9 +472,8 @@ class TodoApp(ft.Column):
     async def filter_changed(self, e):
         selected = self.filter_bar.selected
         self.filter_status = selected[0] if selected else "all"
-        self.update()
-
-    def before_update(self):
+        
+        # Atualiza apenas a propriedade visible de cada tarefa individualmente
         status = self.filter_status
         for task in self.tasks.controls:
             task.visible = (
@@ -299,6 +481,10 @@ class TodoApp(ft.Column):
                 or (status == "active" and not task.completed)
                 or (status == "completed" and task.completed)
             )
+            
+        # Pede ao Flet para atualizar APENAS a lista de tarefas, 
+        # ignorando o resto da página, poupando bastante performance
+        self.tasks.update()
 
 
 # -------------------------
@@ -308,9 +494,14 @@ class TodoApp(ft.Column):
 async def main(page: ft.Page):
     page.title = "To-Do App"
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
-    page.padding = ft.Padding.only(left=20, top=80, right=20)
+    page.scroll = ft.ScrollMode.ADAPTIVE  
+    page.padding = ft.Padding.only(left=20, top=80, right=20, bottom=80)
 
-    app = TodoApp()
+    # Autenticação OAuth2 (GitHub) antes de mostrar o gestor de tarefas
+    user_id, username = await github_device_login(page)
+
+    page.clean()  # Limpa os controlos do login
+    app = TodoApp(user_id=user_id)
     page.add(app)
 
 
